@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environment
+.venv/
+
+# Experimental data
+*.clog
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# AI models
+*.pt
+*.pth
+*.ckpt
+
+# Generated outputs
+results/
+outputs/
+
+# Local configuration
+.env
+configs/local_paths.json
