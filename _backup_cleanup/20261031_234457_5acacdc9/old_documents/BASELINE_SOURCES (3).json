@@ -1,0 +1,14 @@
+{
+  "source_archives_sha256": {
+    "APEX-T-G-geometry-labeler.zip": "3cd29008863ac3c9dc9e4e197a6c396d6bfc757f97cf64f3ce642c9767489ac6",
+    "APEX-T-M2-fast-labeler.zip": "3ac7e4d31d4a72b9d072b01c707f455591ce88a402730d593aeadc1d357523ee",
+    "APEX-T-MT-fast-labeler.zip": "df80a93cf5eabdebbc12d02f0579c0cf9ed6b5b115f20dfbad052db3751e94eb"
+  },
+  "bundled_modules_sha256": {
+    "__init__.py": "dff0cb62e46c7f65cdf4eed488b0682bd6315ebd78856e41bc2ec9b94306e54c",
+    "geometry.py": "da8b136d82f5c9cfa7c3df364ccc8c517a6654e7bb6f65e8ba64a4acde7eb05b",
+    "multiple_tracks.py": "c662bc52c76a2b933bc0580c3581d3f1af7e8eb81dc54a02192fc9d60151983c",
+    "topology.py": "218fd7c67f63a6e9ae7f66a88be944b8a3c56ba82ac79d5ddf951931016f1618"
+  },
+  "note": "M and T source copies unchanged. G import changed to relative .topology within frozen namespace. Original user modules are not imported or overwritten."
+}

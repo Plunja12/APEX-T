@@ -1,3 +1,4 @@
+### před instaluje knihovny
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -9,7 +10,8 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
-    "matplotlib"
+    "matplotlib",
+    "scipy"
 ]
 
 [tool.setuptools.packages.find]

@@ -1,0 +1,386 @@
+"""APEX-T G1 screen: display original, skeleton T, trajectories M, geometry G.
+
+Run from project root:
+python scripts/label_clusters_mtg.py --dataset 2 --min-g 35 --limit 50
+
+The G threshold is preliminary. M and T are visible at all times.
+Raw measurement files and earlier labels are not modified.
+"""
+from __future__ import annotations
+import argparse
+import csv
+from datetime import datetime, timezone
+import hashlib
+from pathlib import Path
+import random
+import sqlite3
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+from matplotlib.colors import Normalize
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'src'))
+sys.path.insert(0, str(ROOT / 'scripts'))
+from pileup.io.clog_reader import iter_frames, cluster_to_local_matrix
+from pileup.multiple_tracks import score_m, VERSION as M_VERSION
+from pileup.topology import score_t, VERSION_T
+from pileup.geometry import score_g, VERSION_G
+
+FIELDS = ['timestamp_utc', 'dataset', 'source', 'frame', 'cluster', 'label',
+          'n_pixels', 'M', 'T', 'G', 'm_version', 't_version', 'g_version',
+          'm_status', 't_status', 'g_status', 't_endpoints', 't_junctions',
+          'g_width_component', 'g_concavity_component', 'g_solidity', 'notes']
+
+
+def select_measurement(dataset, custom):
+    if custom:
+        p = Path(custom).expanduser().resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f'Not a measurement file: {p}')
+        return p
+    data_dir = ROOT / 'data' / 'raw'
+    folders = [p for p in data_dir.iterdir()
+               if p.is_dir() and p.name.startswith(f'{dataset:02d} ')]
+    if len(folders) != 1:
+        raise RuntimeError(f'Expected exactly one dataset {dataset} folder, found {len(folders)}')
+    files = [p for p in folders[0].rglob('*') if p.is_file() and
+             (p.suffix.lower() == '.clog' or p.name.lower().startswith(('itot', 'tot_', 'cnt_')))]
+    if len(files) != 1:
+        raise RuntimeError(f'Expected exactly one measurement file, found {len(files)}: {files}')
+    return files[0]
+
+
+def read_candidates(source, min_pixels):
+    items = []
+    for frame_id, clusters in iter_frames(source):
+        for cid, cl in enumerate(clusters):
+            if len(cl) >= min_pixels:
+                items.append((frame_id, cid, cl))
+    return items
+
+
+def existing_labels(path, source):
+    completed = set()
+    if not path.exists():
+        return completed
+    with path.open('r', encoding='utf-8-sig', newline='') as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames != FIELDS:
+            raise RuntimeError(f'CSV schema differs: {path}; use a different --output path')
+        for row in reader:
+            if row['source'] == str(source.resolve()):
+                completed.add((int(row['frame']), int(row['cluster'])))
+    return completed
+
+
+def score_candidates(source, items, cache_path, min_m, min_t, min_g, done, limit=None, seed=42):
+    st = source.stat()
+    sig = hashlib.sha256(f'{source.resolve()}:{st.st_size}:{st.st_mtime_ns}:{M_VERSION}:{VERSION_T}:{VERSION_G}'.encode()).hexdigest()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(cache_path)
+    try:
+        conn.execute('CREATE TABLE IF NOT EXISTS geometry_scores (signature TEXT, frame INTEGER, cluster INTEGER, m REAL, t REAL, g REAL, PRIMARY KEY(signature,frame,cluster))')
+        cached = {(f, c): (m, t, g) for f, c, m, t, g in conn.execute(
+            'SELECT frame, cluster, m, t, g FROM geometry_scores WHERE signature = ?', (sig,))}
+        print(f'Cached scores: {len(cached)} | Total eligible: {len(items)}', flush=True)
+        # Randomize *before* scoring: --limit no longer forces a full dataset scan.
+        ordered = list(items)
+        if limit is not None:
+            random.Random(seed).shuffle(ordered)
+        chosen = []
+        insert = []
+        for index, (frame, cid, cluster) in enumerate(ordered, 1):
+            if (frame, cid) in done:
+                continue
+            if (frame, cid) not in cached:
+                try:
+                    m = float(score_m(cluster)['M'])
+                    topology = score_t(cluster)
+                    t = float(topology['T'])
+                    g = float(score_g(cluster, topology=topology)['G'])
+                except (ValueError, np.linalg.LinAlgError) as exc:
+                    print(f'Score issue frame={frame} cluster={cid}: {exc}', flush=True)
+                    m, t, g = 0.0, 0.0, 0.0
+                cached[(frame, cid)] = (m, t, g)
+                insert.append((sig, frame, cid, m, t, g))
+            m, t, g = cached[(frame, cid)]
+            if (100*m >= min_m or 100*t >= min_t or 100*g >= min_g):
+                chosen.append((frame, cid, cluster))
+            if len(insert) >= 100:
+                with conn:
+                    conn.executemany('INSERT OR REPLACE INTO geometry_scores VALUES (?,?,?,?,?,?)', insert)
+                insert.clear()
+            if index % 250 == 0:
+                print(f'Screened {index}/{len(ordered)}; selected {len(chosen)}', flush=True)
+            if limit is not None and len(chosen) >= limit:
+                break
+        if insert:
+            with conn:
+                conn.executemany('INSERT OR REPLACE INTO geometry_scores VALUES (?,?,?,?,?,?)', insert)
+        return chosen
+    finally:
+        conn.close()
+
+
+class Labeler:
+    def __init__(self, items, source, output, dataset, seed):
+        self.items = list(items)
+        self.source = source.resolve()
+        self.output = output
+        self.dataset = dataset
+        self.saved = 0
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='apext-mt')
+        self.active_future = None
+        self.prefetch_future = None
+        self.prefetch_key = None
+        self.compute_start = None
+        self.closed = False
+        self.current = None
+        self.m_result = None
+        self.t_result = None
+        self.g_result = None
+        self.fig, (self.raw, self.topo, self.multi, self.geo) = plt.subplots(1, 4, figsize=(19.3, 7.4))
+        self.fig.subplots_adjust(left=.045, right=.99, top=.82, bottom=.24, wspace=.24)
+        self.title = self.fig.text(.5, .945, '', ha='center', fontsize=13, fontweight='bold')
+        self.meta = self.fig.text(.5, .88, '', ha='center', fontsize=10)
+        self.help = self.fig.text(.5, .035,
+            '1: pile-up    2: not pile-up    3: uncertain    Space: skip    Q: exit',
+            ha='center', fontsize=10)
+        self.buttons = []
+        for x, label, color, key in [
+            (.09, 'PILE-UP [1]', '#bce5c3', 'pileup'),
+            (.385, 'NOT PILE-UP [2]', '#f2cccc', 'not_pileup'),
+            (.68, 'UNCERTAIN [3]', '#f8e8b5', 'uncertain')]:
+            b = Button(self.fig.add_axes([x, .105, .235, .075]), label,
+                       color=color, hovercolor='#eeeeee')
+            b.on_clicked(lambda evt, value=key: self.record(value))
+            self.buttons.append(b)
+        self.fig.canvas.mpl_connect('key_press_event', self.on_key)
+        self.fig.canvas.mpl_connect('close_event', self.on_close)
+        # GUI timer polls the worker; Matplotlib is touched ONLY on main thread.
+        self.timer = self.fig.canvas.new_timer(interval=80)
+        self.timer.add_callback(self.poll)
+        self.timer.start()
+        self.next_cluster()
+
+    @staticmethod
+    def compute(cluster):
+        started = time.perf_counter()
+        m = score_m(cluster)
+        m_time = time.perf_counter() - started
+        started = time.perf_counter()
+        t = score_t(cluster)
+        t_time = time.perf_counter() - started
+        started = time.perf_counter()
+        g = score_g(cluster, topology=t)
+        g_time = time.perf_counter() - started
+        return m, t, g, m_time, t_time, g_time
+
+    def on_close(self, event):
+        self.closed = True
+        self.timer.stop()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+    def next_cluster(self):
+        if self.closed:
+            return
+        if not self.items:
+            self.current = None
+            self.m_result = self.t_result = self.g_result = None
+            for ax in (self.raw, self.topo, self.multi, self.geo):
+                ax.clear()
+                ax.set_axis_off()
+            self.title.set_text('All selected clusters reviewed')
+            self.meta.set_text(f'Saved this session: {self.saved}')
+            self.fig.canvas.draw_idle()
+            return
+        self.current = self.items.pop()
+        frame, cid, cluster = self.current
+        self.m_result = self.t_result = self.g_result = None
+        key = (frame, cid)
+        if self.prefetch_key == key and self.prefetch_future is not None:
+            self.active_future = self.prefetch_future
+        else:
+            self.active_future = self.executor.submit(self.compute, cluster)
+        self.prefetch_future = None
+        self.prefetch_key = None
+        self.compute_start = time.perf_counter()
+        self.title.set_text(f'Dataset {self.dataset} | Frame {frame} | Cluster {cid}')
+        self.meta.set_text('Computing M, skeleton T and geometry G… (window stays responsive)')
+        # Clear older plots, avoiding visual mismatch between label and pixels.
+        for ax in (self.raw, self.topo, self.multi, self.geo):
+            ax.clear()
+            ax.set_axis_off()
+        self.fig.canvas.draw_idle()
+        # Ready cached prefetch may already be complete.
+        self.poll()
+
+    def poll(self):
+        if self.closed or self.active_future is None or not self.active_future.done():
+            return True
+        future, self.active_future = self.active_future, None
+        try:
+            self.m_result, self.t_result, self.g_result, m_seconds, t_seconds, g_seconds = future.result()
+        except Exception as exc:
+            frame, cid, _ = self.current
+            self.title.set_text(f'Error on frame {frame}, cluster {cid}')
+            self.meta.set_text(f'{type(exc).__name__}: {exc} | Space to skip')
+            print(f'Failed to compute: {exc}', flush=True)
+            self.fig.canvas.draw_idle()
+            return True
+        frame, cid, _ = self.current
+        print(f'Frame {frame}, cluster {cid} | M {m_seconds:.3f}s | T {t_seconds:.3f}s | G {g_seconds:.3f}s', flush=True)
+        self.draw()
+        if self.items and not self.closed:
+            next_f, next_c, next_cluster = self.items[-1]
+            self.prefetch_key = (next_f, next_c)
+            self.prefetch_future = self.executor.submit(self.compute, next_cluster)
+        return True
+
+    def draw(self):
+        frame, cid, cluster = self.current
+        m, t, g = self.m_result, self.t_result, self.g_result
+        matrix, xmin, ymin, xmax, ymax = cluster_to_local_matrix(cluster)
+        vals = np.asarray([p['value'] for p in cluster], dtype=float)
+        vals = vals[np.isfinite(vals)]
+        lo, hi = (float(vals.min()), float(vals.max())) if vals.size else (0., 1.)
+        norm = Normalize(lo, hi if hi > lo else lo + 1)
+        cmap = plt.get_cmap('viridis').copy()
+        cmap.set_bad('#efefef')
+        padding = max(2, .08*max(xmax-xmin+1, ymax-ymin+1))
+        for ax in (self.raw, self.topo, self.multi, self.geo):
+            ax.clear()
+            ax.imshow(matrix, origin='lower', cmap=cmap, norm=norm,
+                      interpolation='nearest', extent=(xmin-.5, xmax+.5, ymin-.5, ymax+.5))
+            ax.set_xlim(xmin-padding, xmax+padding)
+            ax.set_ylim(ymin-padding, ymax+padding)
+            ax.set_aspect('equal')
+            ax.set_xlabel('x [pixel]')
+            ax.set_ylabel('y [pixel]')
+        self.raw.set_title('Original pixels / signal')
+        self.topo.set_title(f'T = {t["T"]*100:.0f}/100 | ends={t["n_endpoints_t"]} | junctions={t["n_junctions_t"]}', fontsize=11)
+        self.multi.set_title(f'M = {m["M"]*100:.0f}/100 | {m.get("geometry", "unresolved")}', fontsize=11)
+        self.geo.set_title(f'G = {g["G"]*100:.0f}/100 | width={g["width_component"]*100:.0f} | solidity={g["solidity"]:.2f}', fontsize=10)
+        sk = np.asarray(t['skeleton_t'], dtype=float).reshape(-1,2)
+        if len(sk):
+            self.topo.scatter(sk[:,0], sk[:,1], s=12, c='#fff145', marker='s',
+                              edgecolors='none', zorder=5)
+        ep = np.asarray(t['endpoints_t'], dtype=float).reshape(-1,2)
+        if len(ep):
+            self.topo.scatter(ep[:,0], ep[:,1], c='#12c8fc', s=47,
+                              edgecolors='#15232b', zorder=6, label='Endpoints')
+        jp = np.asarray(t['junctions_t'], dtype=float).reshape(-1,2)
+        if len(jp):
+            self.topo.scatter(jp[:,0], jp[:,1], c='#ff4e44', s=100,
+                              marker='x', linewidths=2.5, zorder=7, label='Junctions')
+        # Existing M2: show the estimated fitted lines, if available.
+        points_for_lines = np.asarray([(p['x'], p['y']) for p in cluster], dtype=float)
+        for i, line in enumerate(m.get('lines', [])):
+            try:
+                center = np.asarray(line['center'], dtype=float)
+                direct = np.asarray(line['direction'], dtype=float)
+                points = points_for_lines
+                indices = np.asarray(line.get('indices', []), dtype=int)
+                if len(indices) < 2:
+                    continue
+                projections = (points[indices]-center) @ direct
+                p1 = center + projections.min()*direct
+                p2 = center + projections.max()*direct
+                self.multi.plot([p1[0], p2[0]], [p1[1], p2[1]],
+                                lw=2.5, color=['#00eaff','#ffbc39','#ff62de','#a1ff45'][i % 4], zorder=7)
+            except (IndexError, KeyError, ValueError):
+                pass
+        # Existing M3: visualize curved tracks instead of lines, if supplied.
+        for i, path in enumerate(m.get('paths', [])):
+            xy = np.asarray(path, dtype=float)
+            if xy.ndim == 2 and len(xy):
+                self.multi.plot(xy[:,0], xy[:,1], lw=2.5,
+                                color=['#00eaff','#ffbc39','#ff62de','#a1ff45'][i % 4], zorder=7)
+        spots = np.asarray(g['thick_spots_g'], dtype=float).reshape(-1, 2)
+        if len(spots):
+            self.geo.scatter(spots[:, 0], spots[:, 1], s=26, c='#ff6c28', marker='s',
+                             edgecolors='#431813', linewidths=.3, zorder=7, label='Thickening')
+        self.geo.text(.02, .02, 'Orange = locally thick skeleton', transform=self.geo.transAxes,
+                      fontsize=8, color='#ad4511', ha='left', va='bottom',
+                      bbox=dict(facecolor='white', alpha=.8, edgecolor='none'))
+        self.title.set_text(f'Dataset {self.dataset} | Frame {frame} | Cluster {cid} | M {m["M"]*100:.0f} | T {t["T"]*100:.0f} | G {g["G"]*100:.0f}')
+        self.meta.set_text(f'{len(cluster)} pixels | T: {t["status_t"]} | M: {m.get("status", "unknown")} | G: {g["status_g"]} | Remaining {len(self.items)} | Saved {self.saved}')
+        self.fig.canvas.draw_idle()
+
+    def record(self, label_value):
+        if self.current is None or self.m_result is None or self.t_result is None or self.g_result is None:
+            return
+        frame, cid, cluster = self.current
+        t, m, g = self.t_result, self.m_result, self.g_result
+        row = {'timestamp_utc':datetime.now(timezone.utc).isoformat(),
+               'dataset':self.dataset,'source':str(self.source),
+               'frame':frame,'cluster':cid,'label':label_value,
+               'n_pixels':len(cluster),'M':m['M']*100,'T':t['T']*100,'G':g['G']*100,
+               'm_version':M_VERSION,'t_version':VERSION_T,'g_version':VERSION_G,
+               'm_status':m.get('status',''),'t_status':t['status_t'],'g_status':g['status_g'],
+               't_endpoints':t['n_endpoints_t'],'t_junctions':t['n_junctions_t'],
+               'g_width_component':g['width_component']*100,
+               'g_concavity_component':g['concavity_component']*100,
+               'g_solidity':g['solidity'], 'notes':''}
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        new = not self.output.exists()
+        with self.output.open('a', encoding='utf-8-sig' if new else 'utf-8', newline='') as out:
+            writer = csv.DictWriter(out, fieldnames=FIELDS)
+            if new:
+                writer.writeheader()
+            writer.writerow(row)
+        self.saved += 1
+        print(f'Frame {frame} cluster {cid}: {label_value} | M={row["M"]:.0f} | T={row["T"]:.0f} | G={row["G"]:.0f}', flush=True)
+        self.next_cluster()
+
+    def on_key(self, event):
+        if event.key == '1': self.record('pileup')
+        elif event.key == '2': self.record('not_pileup')
+        elif event.key == '3': self.record('uncertain')
+        elif event.key == ' ': self.next_cluster()
+        elif event.key in ('q','escape'): plt.close(self.fig)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='APEX-T G geometry + existing M and T, interactive labeling')
+    parser.add_argument('--dataset', type=int, default=2)
+    parser.add_argument('--file', type=Path)
+    parser.add_argument('--min-pixels', type=int, default=16)
+    parser.add_argument('--min-m', type=float, default=101,
+                        help='Show cluster if M >= threshold (0..100), 101 disables M filter')
+    parser.add_argument('--min-t', type=float, default=101,
+                        help='OR T >= threshold (0..100), 101 disables T filter')
+    parser.add_argument('--min-g', type=float, default=35,
+                        help='OR G >= threshold (0..100), 101 disables G filter')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='Show at most N randomly chosen matching clusters')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--output', type=Path)
+    args = parser.parse_args()
+    if not (0<=args.min_m<=101 and 0<=args.min_t<=101 and 0<=args.min_g<=101):
+        parser.error('--min-m/--min-t/--min-g must be between 0 and 101')
+    if args.min_pixels < 1 or args.limit is not None and args.limit < 1:
+        parser.error('--min-pixels and --limit must be positive')
+    source = select_measurement(args.dataset, args.file)
+    output = args.output or ROOT/'results'/'labels'/f'dataset_{args.dataset}_mtg.csv'
+    if not output.is_absolute():
+        output = ROOT/output
+    print(f'Measurement: {source}\nM version: {M_VERSION}, T version: {VERSION_T}, G version: {VERSION_G}', flush=True)
+    items = read_candidates(source, args.min_pixels)
+    done = existing_labels(output, source)
+    print(f'Clusters >= {args.min_pixels} pixels: {len(items)} | already reviewed: {len(done)}', flush=True)
+    candidates = score_candidates(source, items, ROOT/'results'/'cache'/f'mtg_dataset_{args.dataset}.sqlite3', args.min_m, args.min_t, args.min_g, done, args.limit, args.seed)
+    print(f'Selected candidates (M >= {args.min_m} OR T >= {args.min_t} OR G >= {args.min_g}): {len(candidates)}', flush=True)
+    if not candidates:
+        print('No candidates. Try --min-g 0 --min-t 101 --min-m 101 to inspect all clusters.')
+        return
+    print(f'Labels will be saved to: {output}', flush=True)
+    Labeler(candidates, source, output, args.dataset, args.seed)
+    plt.show()
+
+if __name__ == '__main__':
+    main()

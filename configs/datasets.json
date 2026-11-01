@@ -1,0 +1,38 @@
+
+{
+  "datasets": {
+    "protons_34": {
+      "particle": "proton",
+      "beam_energy_mev": 34,
+      "detector_label": "TPX",
+      "detector_verified": false,
+      "sensor": "Si",
+      "pixel_value_unit": "unknown",
+      "pixel_signal_type": "unknown",
+      "extra_field": "toa_from_readme"
+    },
+    "electrons_22": {
+      "particle": "electron",
+      "beam_energy_mev": 22,
+      "detector_label": "TPX2",
+      "detector_verified": true,
+      "sensor": "Si",
+      "sensor_thickness_um": 500,
+      "angle_deg": 60,
+      "bias_voltage_v": 80,
+      "acquisition_time_ms": 2.3,
+      "pixel_value_unit": "unknown",
+      "extra_field": "unknown"
+    },
+    "protons_150": {
+      "particle": "proton",
+      "beam_energy_mev": 150,
+      "detector_label": "TPX3",
+      "detector_verified": true,
+      "sensor": "Si",
+      "sensor_thickness_um": 500,
+      "pixel_value_unit": "unknown",
+      "extra_field": "unknown"
+    }
+  }
+}

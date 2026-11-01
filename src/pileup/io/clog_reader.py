@@ -1,14 +1,15 @@
 
+#na trensformaci matic a clusterů
 from pathlib import Path
 import re
 
 import numpy as np
 
 
-# Find the frame number in a header.
+# najde frame, vzor 
 FRAME_RE = re.compile(r"^Frame\s+(\d+)\b")
 
-# Find pixel records inside square brackets.
+# najde pixel, vzor
 PIXEL_RE = re.compile(r"\[([^\[\]]+)\]")
 
 
@@ -39,7 +40,7 @@ def iter_frames(file_path):
 
                 if frame_id is not None:
                     yield frame_id, clusters
-
+# vezme data a yieldne je do clasteru
                 frame_id = int(match.group(1))
                 clusters = []
                 continue
